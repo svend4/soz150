@@ -62,8 +62,18 @@ const ROUTER_SYS = `You are a semantic skill router. Given a task, select 1-3 be
 Return ONLY valid JSON (no markdown, no backticks):
 {"selected":["id1","id2"],"scores":[0.95,0.72],"task_type":"legal|code|writing|data|other","reasoning":"short explanation","language":"ru|de|en"}`;
 
+// ── LRU cache: last 20 unique queries (~2 hours of work) ─────────────────
+const _routeCache = new Map();
+function _routeCacheSet(key, val) {
+  if (_routeCache.size >= 20) _routeCache.delete(_routeCache.keys().next().value);
+  _routeCache.set(key, val);
+}
+
 async function routeTask(task, allSkills) {
   const db = allSkills || SKILLS;
+  const cacheKey = task.slice(0, 60).toLowerCase().replace(/\s+/g,' ').trim();
+  if (_routeCache.has(cacheKey)) return _routeCache.get(cacheKey);
+
   const catalog = db.map(s =>
     `ID:${s.id} | ${s.name} | ${s.desc} | triggers:${s.triggers.slice(0,4).join(",")}`
   ).join("\n");
@@ -71,7 +81,7 @@ async function routeTask(task, allSkills) {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({
-        model:"claude-sonnet-4-20250514", max_tokens:300,
+        model:"claude-sonnet-4-6", max_tokens:300,
         system: ROUTER_SYS,
         messages:[{ role:"user", content:`SKILLS:\n${catalog}\n\nTASK: ${task}\n\nJSON only:` }],
       }),
@@ -84,9 +94,29 @@ async function routeTask(task, allSkills) {
       const s = db.find(x => x.id===id);
       return s ? { skill:s, score: parsed.scores?.[i] ?? 0.7 } : null;
     }).filter(Boolean);
-    return { skills, task_type: parsed.task_type||"other",
-             reasoning: parsed.reasoning||"", language: parsed.language||"ru" };
+    const result = { skills, task_type: parsed.task_type||"other",
+                     reasoning: parsed.reasoning||"", language: parsed.language||"ru" };
+    _routeCacheSet(cacheKey, result);
+    return result;
   } catch { return { skills:[], task_type:"other", reasoning:"", language:"ru" }; }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HISTORY SUMMARIZATION — rolling summary every 6 messages
+// ═══════════════════════════════════════════════════════════════════════════
+async function summarizeHistory(hist) {
+  try {
+    const excerpt = hist.map(m => `${m.role}: ${m.content.slice(0,300)}`).join('\n---\n');
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({
+        model:"claude-sonnet-4-6", max_tokens:250,
+        messages:[{ role:"user", content:`Summarize in max 180 words (keep: case numbers, deadlines, §§, key decisions):\n\n${excerpt}` }],
+      }),
+    });
+    const d = await res.json();
+    return d.content?.[0]?.text || "";
+  } catch { return ""; }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -320,7 +350,7 @@ async function streamSemanticCheck(text, docType, onChunk, onComplete) {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({
-        model:"claude-sonnet-4-20250514", max_tokens:700,
+        model:"claude-sonnet-4-6", max_tokens:700,
         stream: true,
         system: SEMANTIC_STREAM_PROMPT,
         messages:[{ role:"user", content:`Document type: ${docType}\n\n${text}` }],
@@ -391,12 +421,18 @@ async function runPY(code) {
     return { result:null, error:e.message };
   }
 }
+const DANGEROUS_JS = /document\.cookie|window\.location\s*=|eval\s*\(|document\.write\s*\(/;
 function runJS(code) {
-  try {
-    // eslint-disable-next-line no-new-func
-    const r = new Function(code+"\nreturn typeof run==='function'?run():undefined;")();
-    return { result: r??("(undefined)"), error:null };
-  } catch(e) { return { result:null, error:e.message }; }
+  if (DANGEROUS_JS.test(code)) return Promise.resolve({ result:null, error:"⛔ Небезопасный паттерн заблокирован" });
+  return new Promise(resolve => {
+    const src = `self.onmessage=function(){try{${code}\nconst r=typeof run==='function'?run():undefined;self.postMessage({result:String(r??'(undefined)'),error:null});}catch(e){self.postMessage({result:null,error:e.message});}};`;
+    const url = URL.createObjectURL(new Blob([src],{type:'application/javascript'}));
+    const w = new Worker(url);
+    const t = setTimeout(()=>{ w.terminate(); URL.revokeObjectURL(url); resolve({result:null,error:'⏱ Timeout: выполнение превысило 10s'}); }, 10000);
+    w.onmessage = e => { clearTimeout(t); w.terminate(); URL.revokeObjectURL(url); resolve(e.data); };
+    w.onerror   = e => { clearTimeout(t); w.terminate(); URL.revokeObjectURL(url); resolve({result:null,error:e.message}); };
+    w.postMessage({});
+  });
 }
 function getSessionVars() {
   if (!_py) return {};
@@ -463,6 +499,28 @@ function uploadJSON(cb) {
 function extractCode(text, lang) {
   const m = text.match(lang==="py" ? /```(?:python|py)\n([\s\S]*?)```/ : /```(?:javascript|js)\n([\s\S]*?)```/);
   return m ? m[1].trim() : null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DOMPURIFY — lazy CDN loader for safe HTML output
+// ═══════════════════════════════════════════════════════════════════════════
+let _dp = null;
+function loadDOMPurify() {
+  if (_dp) return Promise.resolve(_dp);
+  return new Promise((res, rej) => {
+    if (window.DOMPurify) { _dp = window.DOMPurify; res(_dp); return; }
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js';
+    s.onload = () => { _dp = window.DOMPurify; res(_dp); };
+    s.onerror = rej;
+    document.head.appendChild(s);
+  });
+}
+function SafeHtml({ html }) {
+  const [safe, setSafe] = useState('');
+  useEffect(() => { loadDOMPurify().then(dp => setSafe(dp.sanitize(html))).catch(() => setSafe('')); }, [html]);
+  return <div style={{ background:"#fff",borderRadius:6,padding:12,fontSize:13,color:"#111" }}
+    dangerouslySetInnerHTML={{ __html: safe }}/>;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -590,8 +648,7 @@ function OutputPane({result, error, running, pyStatus, retrying, retryLog}) {
         {hadRetries&&<span style={{ color:C.yellow,marginLeft:8 }}>⟳ auto-fixed</span>}
       </div>
       {isHtml
-        ? <div style={{ background:"#fff",borderRadius:6,padding:12,fontSize:13,color:"#111" }}
-            dangerouslySetInnerHTML={{ __html:result }}/>
+        ? <SafeHtml html={result}/>
         : <pre style={{ color:C.code,fontSize:12.5,fontFamily:"'Fira Code',monospace",
             whiteSpace:"pre-wrap",margin:0,background:"#060a0e",
             border:`1px solid ${C.border2}`,borderRadius:6,padding:12,
@@ -805,7 +862,7 @@ function SkillComposer({ onSave, onClose, editingSkill }) {
     try {
       const res = await fetch("https://api.anthropic.com/v1/messages",{
         method:"POST", headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({ model:"claude-sonnet-4-20250514", max_tokens:900,
+        body:JSON.stringify({ model:"claude-sonnet-4-6", max_tokens:900,
           stream:true, system:COMPOSER_SYS, messages:newHist }),
       });
       let full="", buf="";
@@ -1505,7 +1562,7 @@ export default function WritingOS() {
     setRunning(true); setCurCode(code);
     let r;
     if(language==="py") { r=await runPY(code); refreshSession(); }
-    else r=await new Promise(res=>setTimeout(()=>res(runJS(code)),180));
+    else { await new Promise(res=>setTimeout(res,180)); r=await runJS(code); }
     setRunning(false);
     return r;
   },[refreshSession]);
@@ -1528,7 +1585,7 @@ export default function WritingOS() {
         const res = await fetch("https://api.anthropic.com/v1/messages",{
           method:"POST", headers:{"Content-Type":"application/json"},
           body:JSON.stringify({
-            model:"claude-sonnet-4-20250514", max_tokens:800,
+            model:"claude-sonnet-4-6", max_tokens:800,
             system:sysPrompt, messages:fixHist,
           }),
         });
@@ -1558,7 +1615,18 @@ export default function WritingOS() {
       result:r.result, error:r.error,
       status: r.error ? "final_fail" : "ok",
     }]);
-    if(!r.error && language==="py") setExecCount(n=>n+1);
+    if(!r.error && language==="py") {
+      setExecCount(n => {
+        const next = n + 1;
+        if (next % 3 === 0) {
+          try {
+            const snap = buildRestoreScript();
+            if (snap) localStorage.setItem('wos_namespace_snapshot', snap);
+          } catch {}
+        }
+        return next;
+      });
+    }
     setOutput(r);
     setRetrying(null);
     setRightTab("output");
@@ -1629,7 +1697,19 @@ export default function WritingOS() {
     );
 
     // STEP 3: MAIN LLM CALL — STREAMING
-    const newHist = [...history,{role:"user",content:text}];
+    // Rolling summary: compress old history when it grows beyond 6 messages
+    let compactHistory = history;
+    if (history.length >= 6) {
+      const summary = await summarizeHistory(history.slice(0, -3));
+      if (summary) {
+        compactHistory = [
+          { role:"user",      content:`[Сводка предыдущего диалога]: ${summary}` },
+          { role:"assistant", content:"Понял, продолжаю с учётом контекста." },
+          ...history.slice(-3),
+        ];
+      }
+    }
+    const newHist = [...compactHistory, {role:"user",content:text}];
 
     // Insert placeholder message immediately — fills in token by token
     setMessages(p=>[...p,{
@@ -1645,7 +1725,7 @@ export default function WritingOS() {
       const res = await fetch("https://api.anthropic.com/v1/messages",{
         method:"POST", headers:{"Content-Type":"application/json"},
         body:JSON.stringify({
-          model:"claude-sonnet-4-20250514", max_tokens:1000,
+          model:"claude-sonnet-4-6", max_tokens:1000,
           stream:true, system:sysPrompt, messages:newHist,
         }),
       });
