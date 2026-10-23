@@ -1502,10 +1502,167 @@ class PaneBoundary extends Component {
   }
 }
 
-function downloadJSON(data, name) {
+// ═══════════════════════════════════════════════════════════════════════════
+// .DOCX EXPORT — no dependencies
+// ═══════════════════════════════════════════════════════════════════════════
+// A .docx is a ZIP of XML parts. This writes the smallest document Word, LibreOffice and pandoc accept
+// (ZIP "stored" = uncompressed: letters are a few KB), so a generated Widerspruch / Brief leaves the app
+// as an editable letter. Each text line becomes a paragraph; empty lines stay empty paragraphs; **bold**
+// and a "BETREFF:" line are bold; tabs and leading spaces are kept; monospace for table-like output.
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+  return t;
+})();
+function crc32(bytes) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+// files: [{name, data: Uint8Array}] → Uint8Array containing a ZIP archive (method 0 = stored, UTF-8 names)
+function zipStore(files, date = new Date()) {
+  const enc = new TextEncoder();
+  const dosTime = (date.getHours() << 11) | (date.getMinutes() << 5) | (date.getSeconds() >> 1);
+  const dosDate = (Math.max(0, date.getFullYear() - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
+  const parts = [], central = [];
+  let offset = 0;
+  for (const f of files) {
+    const name = enc.encode(f.name), crc = crc32(f.data), size = f.data.length;
+    if (size > 0xFFFFFFF0 || offset > 0xFFFFFFF0) throw new Error("ZIP64 is not supported");
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0, 0x04034b50, true);  lh.setUint16(4, 20, true);  lh.setUint16(6, 0x0800, true);  lh.setUint16(8, 0, true);
+    lh.setUint16(10, dosTime, true);    lh.setUint16(12, dosDate, true);
+    lh.setUint32(14, crc, true);        lh.setUint32(18, size, true);        lh.setUint32(22, size, true);
+    lh.setUint16(26, name.length, true); lh.setUint16(28, 0, true);
+    parts.push(new Uint8Array(lh.buffer), name, f.data);
+    const ch = new DataView(new ArrayBuffer(46));
+    ch.setUint32(0, 0x02014b50, true);  ch.setUint16(4, 20, true);  ch.setUint16(6, 20, true);  ch.setUint16(8, 0x0800, true); ch.setUint16(10, 0, true);
+    ch.setUint16(12, dosTime, true);    ch.setUint16(14, dosDate, true);
+    ch.setUint32(16, crc, true);        ch.setUint32(20, size, true);        ch.setUint32(24, size, true);
+    ch.setUint16(28, name.length, true);  /* 30 extra, 32 comment, 34 disk, 36/38 attrs = 0 */  ch.setUint32(42, offset, true);
+    central.push(new Uint8Array(ch.buffer), name);
+    offset += 30 + name.length + size;
+  }
+  const cdSize = central.reduce((n, c) => n + c.length, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+  end.setUint32(12, cdSize, true);    end.setUint32(16, offset, true);
+  const all = [...parts, ...central, new Uint8Array(end.buffer)];
+  const out = new Uint8Array(all.reduce((n, c) => n + c.length, 0));
+  let p = 0;
+  for (const c of all) { out.set(c, p); p += c.length; }
+  return out;
+}
+
+const xmlEsc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+// Keep only characters XML 1.0 allows: control characters are dropped, lone surrogates become U+FFFD.
+function xmlClean(str) {
+  const s = String(str);
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 9 || c === 10 || c === 13 || (c >= 0x20 && c <= 0xD7FF) || (c >= 0xE000 && c <= 0xFFFD)) out += s[i];
+    else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length && s.charCodeAt(i + 1) >= 0xDC00 && s.charCodeAt(i + 1) <= 0xDFFF) { out += s[i] + s[i + 1]; i++; }
+    else if (c >= 0xD800 && c <= 0xDFFF) out += "�";
+  }
+  return out;
+}
+
+// one run of text: tabs become <w:tab/>, spaces are preserved
+function docxRun(text, bold) {
+  if (!text) return "";
+  const rpr = bold ? "<w:rPr><w:b/><w:bCs/></w:rPr>" : "";
+  return text.split("\t").map((seg, i) =>
+    (i ? `<w:r>${rpr}<w:tab/></w:r>` : "") + (seg ? `<w:r>${rpr}<w:t xml:space="preserve">${xmlEsc(seg)}</w:t></w:r>` : "")
+  ).join("");
+}
+function docxParagraph(line) {
+  if (!line.trim()) return "<w:p/>";
+  let bold = false, text = line;
+  const h = text.match(/^\s{0,3}#{1,6}\s+(.*)$/);                  // markdown heading → bold paragraph
+  if (h) { text = h[1]; bold = true; }
+  else if (/^\s*(BETREFF|Betreff)\s*:/.test(text)) bold = true;
+  // **bold** spans (an unbalanced ** is kept literally)
+  const runs = []; let last = 0, m; const re = /\*\*([^*\n]+?)\*\*/g;
+  while ((m = re.exec(text))) { runs.push(docxRun(text.slice(last, m.index), bold), docxRun(m[1], true)); last = m.index + m[0].length; }
+  runs.push(docxRun(text.slice(last), bold));
+  return `<w:p>${runs.join("")}</w:p>`;
+}
+// table-like / aligned output (pandas, ASCII tables, code) reads better in a monospace font
+const looksTabular = text => (text.match(/^.*\S {3,}\S.*$/gm) || []).length >= 3 || /[│┌└├─]{3,}/.test(text);
+
+// text → Uint8Array of a .docx file (A4, Arial 11 pt, DIN-5008-like margins: 25 mm left, 20 mm elsewhere)
+function buildDocx(text, { title = "Writing OS", mono } = {}) {
+  const clean = xmlClean(text).replace(/\r\n?/g, "\n");
+  const useMono = mono ?? looksTabular(clean);
+  const cyr = (clean.match(/[Ѐ-ӿ]/g) || []).length, letters = (clean.match(/\p{L}/gu) || []).length || 1;
+  const lang = cyr / letters > 0.3 ? "ru-RU" : "de-DE";
+  const font = useMono ? "Courier New" : "Arial", size = useMono ? 20 : 22;
+  const NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
+  const HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
+  const body = clean.split("\n").map(docxParagraph).join("");
+  const now = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+  const enc = new TextEncoder();
+  const part = (name, xml) => ({ name, data: enc.encode(HEAD + xml) });
+  return zipStore([
+    part("[Content_Types].xml",
+      '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+      + '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+      + '<Default Extension="xml" ContentType="application/xml"/>'
+      + '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+      + '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
+      + '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
+      + '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>'
+      + '</Types>'),
+    part("_rels/.rels",
+      '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+      + '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+      + '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>'
+      + '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>'
+      + '</Relationships>'),
+    part("word/_rels/document.xml.rels",
+      '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+      + '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+      + '</Relationships>'),
+    part("word/styles.xml",
+      `<w:styles ${NS}><w:docDefaults><w:rPrDefault><w:rPr>`
+      + `<w:rFonts w:ascii="${font}" w:hAnsi="${font}" w:eastAsia="${font}" w:cs="${font}"/><w:sz w:val="${size}"/><w:szCs w:val="${size}"/>`
+      + `<w:lang w:val="${lang}" w:eastAsia="${lang}" w:bidi="ar-SA"/></w:rPr></w:rPrDefault>`
+      + '<w:pPrDefault><w:pPr><w:spacing w:after="0" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults>'
+      + '<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style></w:styles>'),
+    part("word/document.xml",
+      `<w:document ${NS}><w:body>${body}`
+      + '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1417" w:header="709" w:footer="709" w:gutter="0"/></w:sectPr>'
+      + '</w:body></w:document>'),
+    part("docProps/core.xml",
+      '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" '
+      + 'xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+      + `<dc:title>${xmlEsc(xmlClean(title))}</dc:title><dc:creator>Writing OS</dc:creator>`
+      + `<dcterms:created xsi:type="dcterms:W3CDTF">${now}</dcterms:created><dcterms:modified xsi:type="dcterms:W3CDTF">${now}</dcterms:modified></cp:coreProperties>`),
+    part("docProps/app.xml",
+      '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>Writing OS</Application></Properties>'),
+  ]);
+}
+
+const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+function downloadBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:"application/json"}));
-  a.download = name; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  a.href = url; a.download = name; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => { try { URL.revokeObjectURL(url); } catch { /* ignore */ } }, 10000);
+}
+const DOCX_KIND = { widerspruch:"widerspruch", eilantrag:"eilantrag", klage:"klage", generic:"dokument" };
+// → the file name that was offered for download
+function exportDocx(text) {
+  const kind = DOCX_KIND[detectLegalDocType(text)] || "dokument";
+  const name = `wos-${kind}-${new Date().toISOString().slice(0, 10)}.docx`;
+  downloadBlob(new Blob([buildDocx(text, { title: `Writing OS — ${kind}` })], { type: DOCX_MIME }), name);
+  return name;
+}
+
+function downloadJSON(data, name) {
+  downloadBlob(new Blob([JSON.stringify(data,null,2)],{type:"application/json"}), name);
 }
 function uploadJSON(cb) {
   const i = document.createElement("input"); i.type="file"; i.accept=".json,.wos";
@@ -1645,7 +1802,7 @@ function CodeLines({code}) {
 // ═══════════════════════════════════════════════════════════════════════════
 // PANELS
 // ═══════════════════════════════════════════════════════════════════════════
-function OutputPane({result, error, running, pyStatus, retrying, retryLog}) {
+function OutputPane({result, error, running, pyStatus, retrying, retryLog, onExportDocx}) {
   if (pyStatus) return <div style={{ padding:16 }}>
     <div style={{ color:C.py,fontSize:12,marginBottom:8,fontFamily:"monospace" }}>⟳ {pyStatus}</div>
     <div style={{ height:3,background:C.border2,borderRadius:2,overflow:"hidden" }}>
@@ -1675,6 +1832,7 @@ function OutputPane({result, error, running, pyStatus, retrying, retryLog}) {
   if ((result===null||result===undefined)&&!error) return <div style={{ padding:14,color:C.textMuted,fontSize:12,fontFamily:"monospace" }}>// output</div>;
   const isHtml = typeof result==="string" && /^\s*<[a-z]/i.test(result);
   const isObj  = typeof result==="object" && result!==null;
+  const canExport = !!onExportDocx && typeof result==="string" && !isHtml && result.trim() !== "" && result !== "(нет вывода)" && result !== "(undefined)";
   return <div style={{ padding:12 }}>
     {/* Retry chain summary badge */}
     {hadRetries&&<div style={{ display:"flex",alignItems:"center",gap:6,marginBottom:8 }}>
@@ -1700,6 +1858,9 @@ function OutputPane({result, error, running, pyStatus, retrying, retryLog}) {
       <div style={{ color:C.green,fontSize:11,marginBottom:8,fontFamily:"monospace" }}>
         <Dot ok={true}/>OK · {isObj?"object":isHtml?"html":typeof result}
         {hadRetries&&<span style={{ color:C.yellow,marginLeft:8 }}>⟳ auto-fixed</span>}
+        {canExport&&<button onClick={onExportDocx} title="Скачать как Word-документ (.docx)" style={{ float:"right",
+          background:"transparent",border:`1px solid ${C.border2}`,color:C.textDim,padding:"1px 9px",borderRadius:4,
+          cursor:"pointer",fontSize:10,fontFamily:"inherit" }}>📄 .docx</button>}
       </div>
       {isHtml
         ? <SafeHtml html={result}/>
@@ -2241,7 +2402,7 @@ function SemanticStream({ text, done }) {
   );
 }
 
-function AssertionPane({ result, checking, onAutoFix, onRecheck }) {
+function AssertionPane({ result, checking, onAutoFix, onRecheck, onExportDocx }) {
   const [expandedId, setExpandedId] = useState(null);
 
   if(checking && !result) return (
@@ -2308,6 +2469,10 @@ function AssertionPane({ result, checking, onAutoFix, onRecheck }) {
             border:`1px solid ${C.border2}`, color:C.textDim,
             padding:"3px 9px", borderRadius:4, cursor:"pointer",
             fontSize:9, fontFamily:"monospace" }}>↺</button>
+          {onExportDocx&&<button onClick={onExportDocx} title="Скачать как Word-документ (.docx)" style={{ background:"transparent",
+            border:`1px solid ${C.border2}`, color:C.textDim,
+            padding:"3px 9px", borderRadius:4, cursor:"pointer",
+            fontSize:9, fontFamily:"monospace" }}>📄 .docx</button>}
           {fixable.length>0&&(
             <button onClick={()=>onAutoFix(fixable)} style={{
               background:"#0d2b0d", border:`1px solid ${C.green}55`,
@@ -2956,6 +3121,12 @@ export default function WritingOS() {
     const when = data.timestamp ? new Date(data.timestamp).toLocaleDateString("ru") : "";
     setToast(note ? `⚠ Загружено${when?` (${when})`:""}, но ${note}` : `✓ Загружено${when?` (${when})`:""}`);
   });
+  const handleExportDocx = ()=>{
+    const text = typeof output.result==="string" ? output.result : "";
+    if(!text.trim()) { setToast("Нет текста для экспорта"); return; }
+    try { setToast(`✓ ${exportDocx(text)} сохранён`); }
+    catch(e) { setToast("✗ Не удалось создать .docx: "+(e?.message||e)); }
+  };
   const handleClear = async ()=>{
     await clearSession(); clearSnapshotStorage(); setRestoreOffer(null);
     setSessionVars({}); setExecCount(0); runsRef.current = 0;
@@ -3261,6 +3432,7 @@ export default function WritingOS() {
               <PaneBoundary tab={rightTab} output={output}>
               {rightTab==="output"&&<OutputPane result={output.result} error={output.error}
                 running={running} retrying={retrying} retryLog={retryLog}
+                onExportDocx={handleExportDocx}
                 pyStatus={lang==="py"&&!pyReady?pyStatus:""}/>}
               {rightTab==="session"&&<SessionPane vars={sessionVars} execCount={execCount}
                 onClear={handleClear} onSave={handleSave} onLoad={handleLoad} lastSaved={lastSaved}/>}
@@ -3270,7 +3442,7 @@ export default function WritingOS() {
                 onEdit={handleEditSkill} onDelete={handleDeleteSkill}/>}
               {rightTab==="assert"&&<AssertionPane
                 result={assertResult} checking={assertChecking}
-                onAutoFix={handleAutoFix} onRecheck={handleRecheck}/>}
+                onAutoFix={handleAutoFix} onRecheck={handleRecheck} onExportDocx={handleExportDocx}/>}
               </PaneBoundary>
             </div>
           </div>
