@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo, Component } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SKILLS DATABASE
@@ -31,7 +31,7 @@ const SKILLS = [
   { id:"code-sandbox", name:"Code Sandbox", cat:"technical",
     desc:"Python 3.11 (Pyodide WASM) or JavaScript execution. Persistent REPL with namespace. numpy, pandas, datetime available. Best for calculations, data analysis, document generation.",
     triggers:["code","python","javascript","calculate","compute","run","pandas","numpy","вычисли","код","скрипт","script","compute","rechnen"],
-    ctx:`SKILL: Live Code Sandbox\nPython: Pyodide 3.11 WASM, persistent REPL, numpy/pandas/datetime\nJS: in-browser eval, wrap in function run(){return result}\nPersistence: variables survive between calls\nLegal use: date calculations, template generation, data tables` },
+    ctx:`SKILL: Live Code Sandbox\nPython: Pyodide 3.11 WASM, persistent REPL, numpy/pandas/datetime\nJS: isolated Web Worker (no DOM/window/localStorage/network), wrap in function run(){return result}; async run() is allowed\nPersistence: variables survive between calls\nLegal use: date calculations, template generation, data tables` },
   { id:"data-analysis", name:"Data Analysis", cat:"technical",
     desc:"Structured data analysis, tables, deadline matrices, cost calculations for Persönliches Budget, document tracking, pandas DataFrames.",
     triggers:["table","tabelle","data","statistics","timeline","costs","budget","диаграмма","таблица","статистика","matrix","übersicht"],
@@ -240,14 +240,14 @@ function persistCustomSkills(skills) {
 // NAMESPACE AUTOSAVE — localStorage
 // ═══════════════════════════════════════════════════════════════════════════
 // Every 3rd successful Python run the runtime's restore script is stored here. On the next visit the app
-// OFFERS to restore it (never runs it silently). It is removed by Clear, by loading a .wos session, by
+// OFFERS to restore it (never runs it silently). It is removed by Clear, by loading a Python .wos session, by
 // "Отбросить", and after 24 h. It holds case data in plain text — that is why it can be discarded.
 const SNAPSHOT_KEY      = "wos_namespace_snapshot";        // the Python restore script itself
 const SNAPSHOT_META_KEY = "wos_namespace_snapshot_meta";   // {ts, runs}
 const SNAPSHOT_TTL_MS   = 24 * 3600 * 1000;
 
 function saveSnapshotToStorage(script, runs) {
-  if (!script) return;
+  if (!script) { clearSnapshotStorage(); return; }   // nothing restorable any more: do not keep the old copy
   try {
     localStorage.setItem(SNAPSHOT_KEY, script);
     localStorage.setItem(SNAPSHOT_META_KEY, JSON.stringify({ ts:Date.now(), runs }));
@@ -268,7 +268,7 @@ function readSnapshotOffer() {
     let meta = {};
     try { meta = JSON.parse(localStorage.getItem(SNAPSHOT_META_KEY) || "{}"); } catch { /* no meta */ }
     if (meta.ts && Date.now() - meta.ts > SNAPSHOT_TTL_MS) { clearSnapshotStorage(); return null; }
-    return { script, ts: meta.ts || null, vars: (script.match(/^ {4}[A-Za-z_]\w*=/gm) || []).length };
+    return { script, ts: meta.ts || null, vars: (script.match(/^try:\n {4}[\p{L}_][\p{L}\p{N}_]*=/gmu) || []).length };
   } catch { return null; }
 }
 
@@ -326,7 +326,7 @@ function buildSysPrompt(lang, sessionVars, routeResult) {
     ? `\nCurrent Python session variables:\n${sessionVars}` : "";
   const codeInstr = lang === "py"
     ? `Write Python. Use print() for output. Packages: numpy, pandas, datetime, json, re.\nSession is persistent — previous variables are accessible.${sessionCtx}\nFormat:\n\`\`\`python\n# code\nprint(result)\n\`\`\``
-    : `Write JavaScript wrapped in function run(){return result}.\nFormat:\n\`\`\`javascript\nfunction run() {\n  // code\n  return result;\n}\n\`\`\``;
+    : `Write JavaScript wrapped in function run(){return result}.\nIt runs in an isolated Web Worker: there is no document, window, DOM, localStorage or network access. Compute and return values (objects and arrays are shown as JSON; build HTML as a string if you need markup). async run() is allowed.\nFormat:\n\`\`\`javascript\nfunction run() {\n  // code\n  return result;\n}\n\`\`\``;
   return `You are Writing OS — German legal document management system with live code execution.
 ${skillCtx ? `\nACTIVE SKILLS:\n${skillCtx}\n` : ""}
 ${codeInstr}
@@ -543,15 +543,15 @@ async function streamSemanticCheck(text, docType, onChunk, onComplete) {
 
 // ── Python snippets (one source of truth for the worker and the fallback) ──
 const PY_SNIPPETS = {
-  // executed once after packages are loaded (same as getPyodide in the app)
+  // executed once after the packages are loaded (and again after a clear)
   init: "import sys,io,json,re,datetime,collections,textwrap",
 
-  // runPY pieces (same as the app)
+  // one run: capture stdout into a StringIO, restore it afterwards
   runBegin: "import sys,io\n_buf=io.StringIO()\nsys.stdout=_buf",
   runEnd: "_buf.getvalue()",
   runRestoreStdout: "sys.stdout=sys.__stdout__",
 
-  // getSessionVars  (verbatim)
+  // session variables as JSON {name:{type,repr}} (public names only)
   vars: String.raw`
 import json as _j
 _skip={'sys','io','json','re','datetime','collections','textwrap','_buf','_j','_skip','__builtins__','__name__','__doc__','__package__','__loader__','__spec__','_out2','_k2','_v2'}
@@ -562,7 +562,7 @@ for _k2,_v2 in list(globals().items()):
         except: pass
 _j.dumps(_out2)`,
 
-  // clearSession  (verbatim)
+  // delete every user-defined name, keep builtins and the base modules
   clear: String.raw`
 _keep=set(dir(__builtins__))|{'sys','io','json','re','datetime','collections','textwrap','__builtins__','__name__','__doc__','__package__','__loader__','__spec__'}
 for _k in list(globals().keys()):
@@ -570,31 +570,21 @@ for _k in list(globals().keys()):
         try: del globals()[_k]
         except: pass`,
 
-  /* buildRestoreScript  (FIXED version, see notes)
+  /* buildRestore - turns the namespace into a Python script that rebuilds it.
    *
-   * Differences from the app's snippet, all of them bug fixes found by running the
-   * original in real Pyodide (see test report):
-   *   1. The original ends with print(...), so runPython() returns undefined and the
-   *      script only goes to the console.  This one ends with the string expression.
-   *   2. Scalars/lists/dicts were emitted with json.dumps() as *Python source*:
-   *      True/None/nan became `true`/`null`/`NaN` (NameError on replay) and emoji were
-   *      split into lone surrogates.  Now: name=json.loads(<python repr of the JSON text>)
-   *      which is exact for every str/int/float/bool/None/list/dict (NaN included).
-   *   3. DataFrame.to_json() was pasted inside '...' - any ' or \ or newline in the data
-   *      broke the string literal.  Now: the JSON text is embedded with repr(), i.e. a
-   *      correctly escaped Python literal, using orient='split' + StringIO + recorded
-   *      dtypes (also avoids pandas' "literal json" FutureWarning and number-like string
-   *      columns such as "007" being turned into numbers).
-   *   4. ndarray keeps its dtype and NaN.
-   *   5. Modules that the user imported (pd, np, math, dt, ...) are re-imported, so code
-   *      that relied on them keeps working after a respawn.
-   *   6. The old header rebound `datetime` to the class (breaking `import datetime`
-   *      style code) and leaked pd/np/date/timedelta into the visible namespace; the
-   *      helpers are now underscore-prefixed (hidden from getSessionVars).
-   *   7. Every variable is restored in its own try/except; failures are collected in
-   *      _wos_failed and reported to JS instead of aborting the whole replay.
-   * Still not restorable (same as before): functions, classes, sets, tuples, bytes,
-   * file handles, Series, user objects.  They are silently dropped.
+   * The script's LAST expression is the string itself (it must not print()): runPython() returns it.
+   *   - str/int/float/bool/None/list/dict: name=json.loads(<python repr of the JSON text>). Exact for
+     *     plain data (NaN included, emoji stay intact). Containers that do NOT survive a JSON round trip
+     *     (tuples inside lists, non-string dict keys, sets, ...) are never restored in a changed form:
+     *     they are skipped and reported.
+   *   - DataFrame: JSON text embedded with repr() (orient='split'), dtypes recorded and re-applied.
+   *   - ndarray: dtype and NaN preserved.
+   *   - modules the user imported (pd, np, math, ...) are re-imported.
+   *   - every variable is restored in its own try/except; failures AND everything that cannot be
+   *     restored at all (functions, classes, sets, tuples, bytes, Series, user objects, lossy
+   *     containers) end up in _wos_failed, which popFailed reports to JS.
+   *   - helper names are underscore-prefixed so they stay hidden from getSessionVars.
+   * Returns "" when there is nothing restorable.
    */
   buildRestore: String.raw`
 import json as _jr
@@ -608,6 +598,7 @@ try:
 except Exception:
     _np_r=None
 _lines_r=[]
+_skipped_r=[]
 _has_df_r=False
 _has_np_r=False
 def _blk_r(_k,_stmt):
@@ -616,7 +607,11 @@ for _k_r,_v_r in list(globals().items()):
     if _k_r.startswith('_') or _k_r in _skip_r or not _k_r.isidentifier(): continue
     try:
         if isinstance(_v_r,(str,int,float,bool,type(None),list,dict)):
-            _lines_r.append(_blk_r(_k_r,_k_r+"=json.loads("+repr(_jr.dumps(_v_r))+")"))
+            _js_r=_jr.dumps(_v_r)
+            if repr(_jr.loads(_js_r))==repr(_v_r):
+                _lines_r.append(_blk_r(_k_r,_k_r+"=json.loads("+repr(_js_r)+")"))
+            else:
+                _skipped_r.append(_k_r)
         elif _pd_r is not None and isinstance(_v_r,_pd_r.DataFrame):
             _lines_r.append(_blk_r(_k_r,_k_r+"=_wos_df("+repr(_v_r.to_json(orient='split',date_format='iso'))+","+repr([str(_t) for _t in _v_r.dtypes])+")"))
             _has_df_r=True
@@ -626,13 +621,17 @@ for _k_r,_v_r in list(globals().items()):
         elif type(_v_r).__name__=='module':
             _mn_r=_v_r.__name__
             _lines_r.append(_blk_r(_k_r,("import "+_mn_r) if _mn_r==_k_r else ("import "+_mn_r+" as "+_k_r)))
+        else:
+            _skipped_r.append(_k_r)
     except Exception:
-        pass
+        _skipped_r.append(_k_r)
 _hdr_r=["import json","_wos_failed=[]"]
 if _has_np_r:
     _hdr_r.append("import numpy as _wos_np")
 if _has_df_r:
     _hdr_r+=["import io as _wos_io","import pandas as _wos_pd","def _wos_df(js,dts):","    d=_wos_pd.read_json(_wos_io.StringIO(js),orient='split',dtype=False,convert_dates=False,convert_axes=False)","    for i,t in enumerate(dts):","        try: d.isetitem(i,d.iloc[:,i].astype(t))","        except Exception: pass","    return d"]
+if _skipped_r:
+    _hdr_r.append("_wos_failed.extend("+repr(_skipped_r)+")")
 _script_r=("\n".join(_hdr_r+_lines_r)) if _lines_r else ""
 _script_r`,
 
@@ -645,7 +644,7 @@ _script_r`,
 function createPyOps(SNIPPETS) {
   var py = null;
 
-  // identical semantics to the app's runPY()
+  // run user code with stdout captured: {result: trimmed stdout | "(нет вывода)", error: message | null}
   async function execCapture(code) {
     try {
       py.runPython(SNIPPETS.runBegin);
@@ -722,7 +721,7 @@ const PY_WORKER_SOURCE = [
   "var createPyOps = function createPyOps(SNIPPETS) {",
   "  var py = null;",
   "",
-  "  // identical semantics to the app's runPY()",
+  "  // run user code with stdout captured: {result: trimmed stdout | \"(нет вывода)\", error: message | null}",
   "  async function execCapture(code) {",
   "    try {",
   "      py.runPython(SNIPPETS.runBegin);",
@@ -857,7 +856,6 @@ function createPyRuntime(userOptions) {
   var S = {
     mode: null,                   // 'worker' | 'main'
     worker: null,
-    workerUrl: null,
     gen: 0,
     nextId: 1,
     pending: new Map(),           // id -> {id, op, worker, resolve, reject, timer}
@@ -892,6 +890,7 @@ function createPyRuntime(userOptions) {
   function safeTerminate(w) {
     try { w.onmessage = null; w.onerror = null; w.onmessageerror = null; } catch (e) {}
     try { w.terminate(); } catch (e) {}
+    if (w && w._url) { try { URL.revokeObjectURL(w._url); } catch (e) {} w._url = null; }
   }
 
   // ---------------------------------------------------------------- snapshot
@@ -909,12 +908,11 @@ function createPyRuntime(userOptions) {
   }
 
   // ---------------------------------------------------------------- worker plumbing
-  function getWorkerUrl() {
-    if (!S.workerUrl) {
-      if (!cfg.workerSource) throw mkErr('worker-unavailable', 'PY_WORKER_SOURCE is not defined');
-      S.workerUrl = URL.createObjectURL(new Blob([cfg.workerSource], { type: 'application/javascript' }));
-    }
-    return S.workerUrl;
+  // One Blob URL PER worker, revoked as soon as the worker has started (hello) or is discarded.
+  // A long-lived shared URL could be revoked from inside the worker (self.location.href), which would
+  // make every later (re)spawn fail.
+  function revokeWorkerUrl(w) {
+    if (w && w._url) { try { URL.revokeObjectURL(w._url); } catch (e) {} w._url = null; }
   }
 
   function rejectPendingFor(w, err) {
@@ -926,7 +924,7 @@ function createPyRuntime(userOptions) {
   function onWorkerMessage(w, d) {
     if (!d) return;
     w._seen = true;
-    if (d.type === 'hello') return;
+    if (d.type === 'hello') { revokeWorkerUrl(w); return; }
     if (d.type === 'status') { status(d.text); return; }
     var p = S.pending.get(d.id);
     if (!p) return;
@@ -951,11 +949,17 @@ function createPyRuntime(userOptions) {
 
   function startWorker() {
     if (typeof Worker === 'undefined') throw mkErr('worker-unavailable', 'Worker is not available in this context');
-    var w;
-    try { w = new Worker(getWorkerUrl()); }
-    catch (e) { throw (e && e.kind) ? e : mkErr('worker-unavailable', 'new Worker() failed: ' + (e && e.message)); }
+    var w, url = null;
+    try {
+      if (!cfg.workerSource) throw mkErr('worker-unavailable', 'PY_WORKER_SOURCE is not defined');
+      url = URL.createObjectURL(new Blob([cfg.workerSource], { type: 'application/javascript' }));
+      w = new Worker(url);
+    } catch (e) {
+      if (url) { try { URL.revokeObjectURL(url); } catch (e2) {} }
+      throw (e && e.kind) ? e : mkErr('worker-unavailable', 'new Worker() failed: ' + (e && e.message));
+    }
     S.workersCreated++; S.gen++;
-    w._seen = false;
+    w._seen = false; w._url = url;
     w.onmessage = function (ev) { if (S.worker === w) onWorkerMessage(w, ev.data); };
     w.onerror = function (ev) { if (ev && ev.preventDefault) ev.preventDefault(); onWorkerFatal(w, 'error', ev && ev.message); };
     w.onmessageerror = function () { onWorkerFatal(w, 'messageerror', ''); };
@@ -1211,7 +1215,6 @@ function createPyRuntime(userOptions) {
     if (S.worker) killWorker(S.worker, 'dispose');
     S.pending.forEach(function (p) { clearTimeout(p.timer); p.reject(mkErr('disposed', 'runtime disposed')); });
     S.pending.clear();
-    if (S.workerUrl) { try { URL.revokeObjectURL(S.workerUrl); } catch (e) {} S.workerUrl = null; }
   }
 
   function getState() {
@@ -1238,7 +1241,7 @@ function createPyRuntime(userOptions) {
     configure: function (o) { Object.assign(cfg, o || {}); },
     getConfig: function () { return Object.assign({}, cfg, { workerSource: cfg.workerSource ? '[' + cfg.workerSource.length + ' chars]' : null, snippets: undefined, opsFactory: undefined }); },
     dispose: dispose,
-    _debug: function () { return { S: S, cfg: cfg, events: S.events.slice(), respawns: S.respawns, workersCreated: S.workersCreated, worker: S.worker, pending: S.pending.size, workerUrl: S.workerUrl }; }
+    _debug: function () { return { S: S, cfg: cfg, events: S.events.slice(), respawns: S.respawns, workersCreated: S.workersCreated, worker: S.worker, pending: S.pending.size, workerUrl: S.worker ? S.worker._url : null }; }
   };
 }
 
@@ -1262,46 +1265,78 @@ function isReady() { return _pyRt().isReady(); }
 function getSnapshot() { return _pyRt().getSnapshot(); }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// JS EXECUTION — Web Worker (no DOM, no page storage, no network APIs)
+// JS EXECUTION — a Web Worker, ideally inside a CSP-locked sandbox frame
 // ═══════════════════════════════════════════════════════════════════════════
-// The generated code is NOT spliced into the worker's source: it is posted as data and compiled inside
-// the worker with new Function. A syntax error is therefore an ordinary catchable error, nothing in the
+// The generated code is NOT spliced into any script source: it is posted as data and compiled inside a
+// Web Worker with new Function. A syntax error is therefore an ordinary catchable error, nothing in the
 // code can collide with the wrapper's identifiers, and a top-level `return` still works.
-// The real isolation is the Worker itself (no DOM, cookies or localStorage) plus fetch / XMLHttpRequest /
-// WebSocket / importScripts being removed inside it. DANGEROUS_JS only gives early, readable errors.
-// Known limit: dynamic import() cannot be disabled from inside a worker. It is blocked by DANGEROUS_JS
-// when written literally, but obfuscated code can still reach it — the host page's CSP (connect-src /
-// script-src) is the real network boundary.
-const JS_TIMEOUT_MS = 10000;
+//
+// Three tiers, strongest first (the first one that starts is remembered and never silently downgraded):
+//   "frame"  The worker lives inside a hidden, sandboxed, OPAQUE-ORIGIN iframe whose CSP is
+//            `default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' blob:; worker-src blob:;
+//            connect-src 'none'`; the worker inherits it. The BROWSER then refuses every network request
+//            (fetch, XHR, WebSocket(Stream), WebTransport, FontFace, import(), …) and the opaque origin
+//            has no access to the app's IndexedDB / Cache / OPFS. A list of removed names can never be
+//            complete (FontFace, WebSocketStream, navigator.storageBuckets all got around one); this is
+//            the real boundary.
+//   "worker" A plain Blob worker: no DOM, cookies or localStorage; common network names are deleted along
+//            the whole prototype chain — best effort only, dynamic import() stays reachable. Used when the
+//            host does not allow the frame.
+//   "inline" The old in-page behaviour (no isolation, no timeout) when Workers are unavailable.
+// Everything a worker sends back is untrusted data: it is validated, normalised and size-capped here.
+const JS_TIMEOUT_MS       = 10000;
+const JS_READY_TIMEOUT_MS = 4000;     // a tier that has not said "ready" by then is treated as unavailable
+const MAX_OUT_CHARS       = 200000;   // cap on anything shown in the UI or sent to the model
 const DANGEROUS_JS = /\bdocument\s*\.\s*(?:cookie|write)\b|\bwindow\s*\.\s*location\s*=|\beval\s*\(|\bimport\s*\(/;
 
-// Result normalisation — objects/arrays/Dates become plain JSON values (OutputPane pretty-prints them),
-// circular or exotic values fall back to a string. Keep in sync with `pack` in JS_WORKER_SRC.
+const capText = (s, n = MAX_OUT_CHARS) => { s = String(s); return s.length > n ? `${s.slice(0, n)}\n…[обрезано ${s.length - n} симв.]` : s; };
+
+// Result normalisation: objects/arrays/Dates become plain JSON values (OutputPane pretty-prints them),
+// circular or exotic values fall back to a string, everything is size-capped. Keep in sync with `pack` in
+// JS_WORKER_SRC (the worker applies the same limits first so that huge values are not even transferred).
 function packJsResult(v) {
   if (v === undefined || v === null) return "(undefined)";
   const t = typeof v;
-  if (t === "string" || t === "number" || t === "boolean") return v;
-  if (t === "object") { try { return JSON.parse(JSON.stringify(v)); } catch { /* fall through */ } }
-  return String(v);
+  if (t === "string") return capText(v);
+  if (t === "number" || t === "boolean") return v;
+  if (t === "object") {
+    try { const j = JSON.stringify(v); if (j !== undefined) return j.length > MAX_OUT_CHARS ? capText(j) : JSON.parse(j); }
+    catch { /* circular / BigInt: fall through */ }
+  }
+  return capText(String(v));
 }
+// Host-side check of a worker reply: exactly {result, error: string|null}, anything else is an error.
+function sanitizeJsReply(d) {
+  if (!d || typeof d !== "object") return { result:null, error:"Некорректный ответ Worker" };
+  if (typeof d.error === "string" && d.error) return { result:null, error:capText(d.error) };
+  if (d.error != null && d.error !== "") return { result:null, error:"Некорректный ответ Worker" };
+  return { result: packJsResult(d.result), error:null };
+}
+const jsTimeoutResult = () => ({
+  result:null, timedOut:true,
+  error:`⏱ Timeout: выполнение превысило ${JS_TIMEOUT_MS / 1000}s — процесс остановлен`,
+});
 
 const JS_WORKER_SRC = `
+var LIMIT = ${MAX_OUT_CHARS};
 var NET = ["fetch","XMLHttpRequest","WebSocket","EventSource","importScripts","indexedDB","caches","BroadcastChannel","SharedWorker","Worker"];
 (function () {
-  // Delete the names along the WHOLE prototype chain: deleting only self.fetch merely shadows it,
-  // Object.getPrototypeOf(self).fetch would still work.
+  // Best effort for the "worker" tier: delete the names along the WHOLE prototype chain (deleting only
+  // self.fetch merely shadows it). The "frame" tier does not rely on this.
   var o = self;
   while (o && o !== Object.prototype) {
     for (var i = 0; i < NET.length; i++) { try { delete o[NET[i]]; } catch (e) {} }
     o = Object.getPrototypeOf(o);
   }
 })();
+function cap(s) { s = String(s); return s.length > LIMIT ? s.slice(0, LIMIT) + "\\n…[truncated]" : s; }
 function pack(v) {
   if (v === undefined || v === null) return "(undefined)";
   var t = typeof v;
-  if (t === "string" || t === "number" || t === "boolean") return v;
-  if (t === "object") { try { return JSON.parse(JSON.stringify(v)); } catch (e) {} }
-  return String(v);
+  if (t === "string") return cap(v);
+  if (t === "number" || t === "boolean") return v;
+  if (t === "object") { try { var j = JSON.stringify(v); if (j !== undefined) return j.length > LIMIT ? cap(j) : JSON.parse(j); } catch (e) {} }
+  return cap(v);
 }
 self.onmessage = async function (ev) {
   try {
@@ -1309,52 +1344,162 @@ self.onmessage = async function (ev) {
     var v = await fn();
     self.postMessage({ result: pack(v), error: null });
   } catch (e) {
-    self.postMessage({ result: null, error: String((e && e.message) || e) });
+    self.postMessage({ result: null, error: cap((e && e.message) || e) });
   }
 };
 self.postMessage({ ready: true });
 `;
 
-let _jsWorkerOk = null;   // null = not known yet, true = works, false = Workers unavailable here → inline fallback
-let _jsWorkerUrl = null;
-const jsWorkerUrl = () => _jsWorkerUrl || (_jsWorkerUrl = URL.createObjectURL(new Blob([JS_WORKER_SRC], { type:"application/javascript" })));
+// ── tier "frame": the bridge document that hosts the worker ────────────────
+const JS_FRAME_CSP = "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' blob:; worker-src blob:; connect-src 'none'";
+const jsFrameHtml = () => '<!doctype html><meta charset="utf-8">'
+  + `<meta http-equiv="Content-Security-Policy" content="${JS_FRAME_CSP}"><script>`
+  + `(function () {
+  var W = ${JSON.stringify(JS_WORKER_SRC).replace(/</g, "\\u003c")};
+  var worker = null, url = null, readies = 0, done = false;
+  function send(m) { parent.postMessage(m, "*"); }
+  function fail(msg) { if (done) return; done = true; try { worker && worker.terminate(); } catch (e) {} send({ kind: "error", message: String(msg) }); }
+  try {
+    url = URL.createObjectURL(new Blob([W], { type: "application/javascript" }));
+    worker = new Worker(url);
+    worker.onmessage = function (e) {
+      var d = e.data;
+      if (d && d.ready === true) {
+        if (readies++) return fail("worker sent a second ready message");
+        try { URL.revokeObjectURL(url); } catch (x) {}
+        return send({ kind: "ready" });
+      }
+      if (done) return;                       // first reply wins; a flood after it is dropped
+      done = true; worker.terminate();
+      send({ kind: "reply", data: d });
+    };
+    worker.onerror = function (e) { if (e.preventDefault) e.preventDefault(); fail(readies ? (e.message || "worker error") : "worker failed to start"); };
+  } catch (e) { fail("worker failed to start: " + ((e && e.message) || e)); }
+  addEventListener("message", function (ev) {
+    if (ev.source === parent && ev.data && typeof ev.data.code === "string" && worker && !done) worker.postMessage({ code: ev.data.code });
+  });
+})();` + '<\/script>';
 
-// Fallback when Workers are blocked (CSP / sandbox): the previous in-page behaviour — no isolation, no timeout.
+// → result | null (null = this tier is unavailable here)
+function runJSFrame(code) {
+  return new Promise(resolve => {
+    let frame, readyTimer, runTimer, ready = false, settled = false;
+    const finish = out => {
+      if (settled) return; settled = true;
+      clearTimeout(readyTimer); clearTimeout(runTimer);
+      window.removeEventListener("message", onMsg);
+      try { frame.remove(); } catch { /* already gone */ }
+      resolve(out);
+    };
+    const onMsg = ev => {
+      if (!frame || ev.source !== frame.contentWindow) return;
+      const m = ev.data;
+      if (!m || typeof m !== "object") return;
+      if (m.kind === "ready" && !ready) {
+        ready = true; clearTimeout(readyTimer);
+        runTimer = setTimeout(() => finish(jsTimeoutResult()), JS_TIMEOUT_MS);
+        frame.contentWindow.postMessage({ code }, "*");
+      } else if (m.kind === "reply" && ready) finish(sanitizeJsReply(m.data));
+      else if (m.kind === "error") finish(ready ? { result:null, error:capText(m.message || "Ошибка Worker") } : null);
+    };
+    window.addEventListener("message", onMsg);
+    try {
+      frame = document.createElement("iframe");
+      frame.setAttribute("sandbox", "allow-scripts");     // deliberately NOT allow-same-origin: opaque origin
+      frame.setAttribute("aria-hidden", "true"); frame.tabIndex = -1; frame.title = "js-sandbox";
+      frame.style.cssText = "position:fixed;width:0;height:0;border:0;opacity:0;pointer-events:none";
+      frame.srcdoc = jsFrameHtml();
+      document.body.appendChild(frame);
+    } catch { return finish(null); }
+    readyTimer = setTimeout(() => finish(null), JS_READY_TIMEOUT_MS);
+  });
+}
+
+// ── tier "worker": plain Blob worker, one fresh Blob URL per run ───────────
+// (a long-lived shared URL could be revoked from inside the worker, which would break every later run)
+function runJSWorker(code) {
+  return new Promise(resolve => {
+    let w, url = null, readyTimer, runTimer, ready = false, done = false;
+    const stop = () => {
+      done = true; clearTimeout(readyTimer); clearTimeout(runTimer);
+      try { w?.terminate(); } catch { /* already gone */ }
+      if (url) { try { URL.revokeObjectURL(url); } catch { /* ignore */ } url = null; }
+    };
+    const settle = out => { if (done) return; stop(); resolve(out); };
+    try {
+      url = URL.createObjectURL(new Blob([JS_WORKER_SRC], { type:"application/javascript" }));
+      w = new Worker(url);
+    } catch { return settle(null); }
+    readyTimer = setTimeout(() => settle(null), JS_READY_TIMEOUT_MS);
+    w.onmessage = e => {
+      if (e.data?.ready === true) {
+        if (ready) return settle({ result:null, error:"Worker отправил повторное сообщение ready" });
+        ready = true; clearTimeout(readyTimer);
+        try { URL.revokeObjectURL(url); } catch { /* ignore */ } url = null;
+        runTimer = setTimeout(() => settle(jsTimeoutResult()), JS_TIMEOUT_MS);
+        w.postMessage({ code });
+        return;
+      }
+      if (ready) settle(sanitizeJsReply(e.data));      // first reply wins; terminate() drops any flood after it
+    };
+    // Errors in the generated code are caught inside the worker, so an error EVENT before "ready" means the
+    // worker itself cannot run here (CSP / sandbox) → tier unavailable.
+    w.onerror = e => { e.preventDefault?.(); settle(ready ? { result:null, error:e.message || "Ошибка Worker" } : null); };
+    w.onmessageerror = () => settle({ result:null, error:"Результат нельзя передать из Worker" });
+  });
+}
+
+// ── tier "inline": previous in-page behaviour — no isolation, no timeout ───
 async function runJSInline(code) {
   try {
     // eslint-disable-next-line no-new-func
     const r = await new Function(code + "\nreturn typeof run==='function'?run():undefined;")();
     return { result: packJsResult(r), error: null };
-  } catch (e) { return { result:null, error:String(e?.message || e) }; }
+  } catch (e) { return { result:null, error:capText(e?.message || e) }; }
 }
 
-function runJS(code) {
-  if (DANGEROUS_JS.test(code)) return Promise.resolve({ result:null, error:"⛔ Небезопасный паттерн заблокирован" });
-  if (_jsWorkerOk === false) return runJSInline(code);
-  return new Promise(resolve => {
-    let w, timer, done = false;
-    const stop = () => { done = true; clearTimeout(timer); try { w?.terminate(); } catch { /* already gone */ } };
-    const settle = out => { if (done) return; stop(); resolve(out); };
-    const useInline = () => { if (done) return; _jsWorkerOk = false; stop(); resolve(runJSInline(code)); };
-    try { w = new Worker(jsWorkerUrl()); } catch { return useInline(); }
-    timer = setTimeout(() => settle({
-      result:null, timedOut:true,
-      error:`⏱ Timeout: выполнение превысило ${JS_TIMEOUT_MS / 1000}s — процесс остановлен`,
-    }), JS_TIMEOUT_MS);
-    w.onmessage = e => {
-      if (e.data?.ready) { _jsWorkerOk = true; return; }
-      settle(e.data);
-    };
-    // Errors in the generated code are caught inside the worker. An error EVENT before the worker said
-    // "ready" means the worker itself cannot run here (CSP / sandbox) → use the in-page fallback.
-    w.onerror = e => {
-      e.preventDefault?.();
-      if (_jsWorkerOk) settle({ result:null, error:e.message || "Ошибка Worker" });
-      else useInline();
-    };
-    w.onmessageerror = () => settle({ result:null, error:"Результат нельзя передать из Worker" });
-    w.postMessage({ code });
-  });
+let _jsTier = null;                  // null = not tested yet, else "frame" | "worker" | "inline"
+const getJsTier = () => _jsTier;
+async function runJS(code) {
+  if (DANGEROUS_JS.test(code)) return { result:null, error:"⛔ Небезопасный паттерн заблокирован" };
+  if (_jsTier === null || _jsTier === "frame") {
+    const r = await runJSFrame(code);
+    if (r) { _jsTier = "frame"; return r; }
+    if (_jsTier === "frame") return { result:null, error:"JS-песочница не ответила" };   // worked before: never silently downgrade
+  }
+  if (_jsTier === null || _jsTier === "worker") {
+    const r = await runJSWorker(code);
+    if (r) { _jsTier = "worker"; return r; }
+    if (_jsTier === "worker") return { result:null, error:"JS Worker не ответил" };
+  }
+  _jsTier = "inline";
+  return runJSInline(code);
+}
+
+// The Python worker is untrusted as well (user code can post forged replies): accept only strings, cap sizes.
+async function runPy(code) {
+  const r = await runPython(code);
+  return {
+    result:   r?.result == null ? null : capText(r.result),
+    error:    r?.error  == null ? null : capText(r.error),
+    timedOut: r?.timedOut === true,
+  };
+}
+
+// A render error inside a pane (for example from an unexpected value) must not blank the whole app.
+// It resets itself when the user switches tab or a new result arrives.
+class PaneBoundary extends Component {
+  constructor(props) { super(props); this.state = { err:null }; }
+  static getDerivedStateFromError(err) { return { err }; }
+  componentDidUpdate(prev) {
+    if (this.state.err && (prev.tab !== this.props.tab || prev.output !== this.props.output)) this.setState({ err:null });
+  }
+  render() {
+    if (!this.state.err) return this.props.children;
+    return <div style={{ padding:14,color:C.red,fontSize:11,fontFamily:"monospace",lineHeight:1.6 }}>
+      ✗ Не удалось отобразить содержимое вкладки: {String(this.state.err?.message || this.state.err)}
+    </div>;
+  }
 }
 
 function downloadJSON(data, name) {
@@ -1377,7 +1522,8 @@ function extractCode(text, lang) {
 // ═══════════════════════════════════════════════════════════════════════════
 // HTML produced by generated code is untrusted. It is sanitised with DOMPurify (pinned version, SRI) and
 // then shown in a sandboxed iframe: no scripts, deny-all CSP. Whatever survives sanitising (<style>,
-// position:fixed overlays, links, remote images) therefore cannot touch the app around it.
+// position:fixed overlays, styled boxes) therefore cannot touch the app around it; remote images and
+// stylesheets are blocked by the CSP, and links are removed.
 const DOMPURIFY_URL = "https://cdn.jsdelivr.net/npm/dompurify@3.4.16/dist/purify.min.js";
 const DOMPURIFY_SRI = "sha384-a7SzOxErzJ3ZpQz0zJ32d67dSitNzPcbfybc/ykU9KJhMgZkwqfSxlhhdJRS+XGL";
 let _dp = null, _dpLoading = null;
@@ -1405,7 +1551,8 @@ function SafeHtml({ html }) {
     loadDOMPurify().then(dp => {
       const clean = dp.sanitize(String(html), {
         FORCE_BODY: true,   // keep a leading <style>
-        FORBID_TAGS: ["form","input","button","textarea","select","base","meta","link","iframe","frame","object","embed"],
+        // <a>/<area>: links cannot work inside the sandbox anyway, and Ctrl/middle-click would still open them
+        FORBID_TAGS: ["a","area","form","input","button","textarea","select","base","meta","link","iframe","frame","object","embed"],
       });
       const srcDoc = '<!doctype html><html><head><meta charset="utf-8">'
         + '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'; img-src data:">'
@@ -1525,7 +1672,7 @@ function OutputPane({result, error, running, pyStatus, retrying, retryLog}) {
   // Show retry chain summary if there were retries
   const hadRetries = retryLog && retryLog.length > 1;
 
-  if (!result&&!error) return <div style={{ padding:14,color:C.textMuted,fontSize:12,fontFamily:"monospace" }}>// output</div>;
+  if ((result===null||result===undefined)&&!error) return <div style={{ padding:14,color:C.textMuted,fontSize:12,fontFamily:"monospace" }}>// output</div>;
   const isHtml = typeof result==="string" && /^\s*<[a-z]/i.test(result);
   const isObj  = typeof result==="object" && result!==null;
   return <div style={{ padding:12 }}>
@@ -2451,6 +2598,7 @@ export default function WritingOS() {
   // ── Python runtime / autosave ─────────────────────────────────────────────
   const [restoreOffer,  setRestoreOffer]  = useState(null);   // {script, ts, vars} from a previous visit
   const [pyMode,        setPyMode]        = useState(null);   // "worker" | "main" (main = no timeout protection)
+  const [jsTier,        setJsTier]        = useState(null);   // "frame" | "worker" | "inline" (how JS is isolated)
   const chatRef = useRef(null);
   // Refs, not state: they are read inside async callbacks and must never be stale.
   const busyRef        = useRef(false);   // a send() is in flight
@@ -2458,6 +2606,7 @@ export default function WritingOS() {
   const summaryRef     = useRef(null);    // {text, code[], upto} — rolling summary of `history`
   const summaryFailRef = useRef(null);    // history length at the last failed summarisation (back-off)
   const runsRef        = useRef(0);       // successful Python runs → autosave cadence
+  const abortRef       = useRef(null);    // AbortController of the exchange in flight
 
   // All skills = built-in + user-created (memoised: send() depends on it)
   const allSkills = useMemo(()=>[...SKILLS, ...customSkills],[customSkills]);
@@ -2467,7 +2616,11 @@ export default function WritingOS() {
   // Python runtime events → notices (timeouts, restarts, fallback to the main thread)
   const onPyEvent = useCallback(ev=>{
     if(ev.type==="timeout")            setToast("⏱ Python остановлен по таймауту, перезапуск…");
-    else if(ev.type==="respawn-ready") setToast(ev.restored ? "✓ Python перезапущен, переменные восстановлены" : "✓ Python перезапущен");
+    else if(ev.type==="respawn-ready") {
+      const lost = ev.failed?.length ? ` · не сохраняются: ${ev.failed.slice(0,6).join(", ")}` : "";
+      setToast(ev.restored ? `✓ Python перезапущен, переменные восстановлены${lost}` : `✓ Python перезапущен${lost}`);
+      getSessionVars().then(setSessionVars);   // the Session tab must not keep listing what the restart lost
+    }
     else if(ev.type==="respawn-failed") setToast("✗ Не удалось перезапустить Python");
     else if(ev.type==="fallback")      setPyMode("main");
   },[]);
@@ -2486,7 +2639,7 @@ export default function WritingOS() {
     return ()=>{ alive = false; };
   },[lang,pyReady,onPyEvent]);
 
-  const refreshSession = useCallback(async ()=>{ if(isReady()) setSessionVars(await getSessionVars()); },[]);
+  const refreshSession = useCallback(async ()=>{ setSessionVars(await getSessionVars()); },[]);
 
   const handleRestore = async ()=>{
     const offer = restoreOffer; setRestoreOffer(null);
@@ -2499,20 +2652,27 @@ export default function WritingOS() {
   const handleDiscardSnapshot = ()=>{ clearSnapshotStorage(); setRestoreOffer(null); };
 
   // ── Raw single execution (no retry) ─────────────────────────────────────
-  const rawExecute = useCallback(async (code, language)=>{
+  // `epoch`: the session this run belongs to. If the session was replaced (language switch / load) before
+  // the run starts, nothing is executed and no state is touched.
+  const rawExecute = useCallback(async (code, language, epoch)=>{
+    const mine = ()=>epoch===undefined || epoch===epochRef.current;
+    if(!mine()) return { result:null, error:null, replaced:true };
     setRunning(true); setCurCode(code);
     let r;
     try {
-      if(language==="py") { r=await runPython(code); await refreshSession(); }
-      else { await new Promise(res=>setTimeout(res,180)); r=await runJS(code); }
-    } finally { setRunning(false); }
+      if(language==="py") { r=await runPy(code); refreshSession(); }
+      else { await new Promise(res=>setTimeout(res,180)); r=await runJS(code); setJsTier(getJsTier()); }
+    } finally { if(mine()) setRunning(false); }
     return r;
   },[refreshSession]);
 
   // ── Execute with auto-retry (max MAX_RETRIES attempts) ───────────────────
-
-  const executeWithRetry = useCallback(async (code, language, sysPrompt, hist, attempt=0)=>{
-    const r = await rawExecute(code, language);
+  // Every await is followed by a stale() check: an exchange abandoned by a language switch / load must not
+  // write its output, retry bubbles or counters into the NEW session, nor run its fixed code there.
+  const executeWithRetry = useCallback(async (code, language, sysPrompt, hist, attempt=0, epoch=epochRef.current)=>{
+    const stale = ()=>epoch!==epochRef.current;
+    const r = await rawExecute(code, language, epoch);
+    if(stale()) return r;
 
     if(r.error && attempt < MAX_RETRIES) {
       // Record this failure in log
@@ -2534,6 +2694,7 @@ export default function WritingOS() {
         });
         if(!res.ok) throw new Error(`API ${res.status}`);
         const d = await res.json();
+        if(stale()) return r;
         const fixTxt = firstText(d);
         const fixedCode = extractCode(fixTxt, language);
 
@@ -2547,9 +2708,10 @@ export default function WritingOS() {
 
         if(fixedCode) {
           // Recurse with the fixed code
-          return executeWithRetry(fixedCode, language, sysPrompt, hist, attempt+1);
+          return executeWithRetry(fixedCode, language, sysPrompt, hist, attempt+1, epoch);
         }
       } catch(e) { /* network error — fall through to show original error */ }
+      if(stale()) return r;
       setRetrying(null);
     }
 
@@ -2562,7 +2724,8 @@ export default function WritingOS() {
     if(!r.error && language==="py") {
       setExecCount(n=>n+1);
       // Autosave every 3rd successful run. The snapshot was already captured inside the worker after the
-      // run, so this is a cheap synchronous read — and it lives outside any state updater.
+      // run, so this is a cheap synchronous read — and it lives outside any state updater. An EMPTY
+      // snapshot (everything was deleted / nothing restorable) removes the old autosave instead of keeping it.
       runsRef.current += 1;
       if(runsRef.current % 3 === 0) saveSnapshotToStorage(getSnapshot(), runsRef.current);
     }
@@ -2589,12 +2752,14 @@ export default function WritingOS() {
             structural.docType,
             // onChunk — update stream text as tokens arrive
             (streamText) => {
+              if(stale()) return;
               setAssertResult(prev => prev
                 ? { ...prev, semanticStream: streamText }
                 : prev);
             },
             // onComplete — set parsed JSON + final score
             (streamText, parsed) => {
+              if(stale()) return;
               setAssertChecking(false);
               const semantic = parsed || null;
               const finalScore = semantic
@@ -2617,13 +2782,16 @@ export default function WritingOS() {
   // ── UNIFIED PIPELINE: route → inject → generate → execute ────────────────
   // In-flight guard is busyRef (set synchronously, released in `finally`): a `loading` state value read
   // from a memoised closure goes stale and used to swallow every message after the first exchange.
+  // `epoch` ties the exchange to the session it started in: abandon() (language switch / load) bumps the
+  // epoch, aborts the stream and releases the lock; the old exchange then notices and stops writing state.
   const send = useCallback(async (text)=>{
     if(!text.trim()) return;
     if(busyRef.current) { setToast("Подождите: предыдущий запрос ещё выполняется"); return; }
     if(lang==="py"&&!pyReady) { setToast("Python ещё загружается…"); return; }
     busyRef.current = true;
     const epoch = epochRef.current;
-    const replaced = ()=>epoch!==epochRef.current;   // language switched / session loaded while we were busy
+    const replaced = ()=>epoch!==epochRef.current;
+    const ac = new AbortController(); abortRef.current = ac;
     const time = new Date().toLocaleTimeString("ru",{hour:"2-digit",minute:"2-digit"});
     setMessages(p=>[...p,{role:"user",content:text,lang,time}]);
     setInput(""); setLoading(true); setOutput({result:null,error:null});
@@ -2636,8 +2804,8 @@ export default function WritingOS() {
         routeTask(text, allSkills),
         compactHistory(history, summaryRef.current, summaryFailRef.current),
       ]);
-      setRouting(false);
       if(replaced()) return;
+      setRouting(false);
       setLastRoute(routeResult);
       summaryRef.current = compacted.summary; summaryFailRef.current = compacted.failedAt;
 
@@ -2665,7 +2833,7 @@ export default function WritingOS() {
 
       try {
         const res = await fetch("https://api.anthropic.com/v1/messages",{
-          method:"POST", headers:{"Content-Type":"application/json"},
+          method:"POST", headers:{"Content-Type":"application/json"}, signal:ac.signal,
           body:JSON.stringify({
             model:MODEL, max_tokens:1000,
             stream:true, system:sysPrompt, messages:newHist,
@@ -2678,7 +2846,7 @@ export default function WritingOS() {
 
         outer: while(true) {
           const {done, value} = await reader.read();
-          if(done) break;
+          if(done || replaced()) break;
 
           sseBuffer += decoder.decode(value, {stream:true});
           const lines = sseBuffer.split("\n");
@@ -2704,10 +2872,11 @@ export default function WritingOS() {
           }
         }
       } catch(e) {
+        if(replaced()) return;                       // aborted on purpose
         fullText = `Ошибка: ${e.message}`;
         failed = true;
       } finally {
-        setStreaming(false);
+        if(!replaced()) setStreaming(false);
       }
       if(replaced()) return;
 
@@ -2726,46 +2895,66 @@ export default function WritingOS() {
       // STEP 4: EXECUTE WITH AUTO-RETRY
       setRetryLog([]);
       if(code) {
-        await executeWithRetry(code, lang, sysPrompt, [...newHist, {role:"assistant",content:fullText}], 0);
+        await executeWithRetry(code, lang, sysPrompt, [...newHist, {role:"assistant",content:fullText}], 0, epoch);
       } else if(routeResult.skills.length>0) {
         setRightTab("skills");
       }
     } finally {
-      busyRef.current = false;
-      setRouting(false); setStreaming(false); setLoading(false);
+      // Only the exchange that still owns the session may release the lock / reset the flags: an abandoned
+      // one must not unlock (or clear the indicators of) a newer exchange.
+      if(!replaced()) {
+        busyRef.current = false;
+        setRouting(false); setStreaming(false); setLoading(false);
+      }
     }
   },[lang,pyReady,history,allSkills,executeWithRetry]);
+
+  // A new session replaces the current one (language switch / .wos load): stop caring about whatever is in
+  // flight. The old exchange sees the new epoch and stops; its stream is aborted; the input unlocks at once.
+  const abandon = ()=>{
+    epochRef.current++;
+    abortRef.current?.abort();
+    busyRef.current = false;
+    summaryRef.current = null; summaryFailRef.current = null;
+    setLoading(false); setRouting(false); setStreaming(false); setRunning(false); setRetrying(null);
+  };
 
   // ── SAVE / LOAD ───────────────────────────────────────────────────────────
   const handleSave = async ()=>{
     const ts = new Date().toISOString();
-    const rs = lang==="py" && isReady() ? await buildRestoreScript() : null;
+    // No isReady() gate: buildRestoreScript waits for a respawn in progress (or returns the last snapshot),
+    // whereas the gate silently wrote session:null exactly when the user most wanted to secure the work.
+    const rs = lang==="py" ? await buildRestoreScript() : null;
     downloadJSON({version:"1.2",app:"Writing OS Unified",timestamp:ts,
       lang,execCount,curCode,messages,history,summary:summaryRef.current,output,
       session:rs?{restoreScript:rs}:null},
       `wos-${ts.slice(0,10)}-${ts.slice(11,16).replace(":","-")}.wos`);
     setLastSaved(new Date().toLocaleTimeString("ru",{hour:"2-digit",minute:"2-digit",second:"2-digit"}));
-    setToast("✓ Сессия сохранена");
+    setToast(lang==="py" && !rs ? "✓ Сессия сохранена (переменных для сохранения нет)" : "✓ Сессия сохранена");
   };
   const handleLoad = ()=>uploadJSON(async data=>{
     if(!data.messages) { setToast("✗ Неверный формат"); return; }
-    epochRef.current++;                                       // abandon any exchange still in flight
+    abandon();
     setMessages(data.messages||[]); setHistory(data.history||[]);
-    summaryRef.current = data.summary?.text ? data.summary : null; summaryFailRef.current = null;
+    summaryRef.current = data.summary?.text ? data.summary : null;
     setCurCode(data.curCode||""); setOutput(data.output||{result:null,error:null});
     setExecCount(data.execCount||0); runsRef.current = 0;
+    let note = "";
     if(data.lang==="py") {
       setLang("py");
       if(!isReady()) { await initPy(setPyStatus,{ onEvent:onPyEvent }); setPyReady(true); setPyStatus(""); }
       if(data.session?.restoreScript) {
         const r = await restoreFromScript(data.session.restoreScript);
         await refreshSession();
-        if(r.error) setToast("✗ Не удалось восстановить переменные: "+String(r.error).split("\n").pop());
+        if(r.error) note = "переменные не восстановлены: "+String(r.error).split("\n").pop();
+        else if(r.failed?.length) note = "пропущено: "+r.failed.slice(0,6).join(", ");
       }
       // The loaded session defines the namespace now: an older autosave must not be offered afterwards.
       clearSnapshotStorage(); setRestoreOffer(null);
     } else setLang(data.lang||"js");
-    setToast(`✓ Загружено (${new Date(data.timestamp).toLocaleDateString("ru")})`);
+    // ONE toast: a second setToast in the same tick would replace the first, hiding a failed restore
+    const when = data.timestamp ? new Date(data.timestamp).toLocaleDateString("ru") : "";
+    setToast(note ? `⚠ Загружено${when?` (${when})`:""}, но ${note}` : `✓ Загружено${when?` (${when})`:""}`);
   });
   const handleClear = async ()=>{
     await clearSession(); clearSnapshotStorage(); setRestoreOffer(null);
@@ -2773,7 +2962,7 @@ export default function WritingOS() {
     setToast("✓ Namespace очищен");
   };
   const switchLang = l=>{
-    epochRef.current++; summaryRef.current = null; summaryFailRef.current = null;
+    abandon();
     setLang(l); setMessages([]); setHistory([]); setCurCode(""); setOutput({result:null,error:null});
     setAssertResult(null); setAssertChecking(false);
   };
@@ -3002,7 +3191,7 @@ export default function WritingOS() {
               display:"flex",alignItems:"center",gap:8 }}>
               <span>⌥ Code</span>
               <span style={{ color:C.textMuted }}>{lang==="py"?"sandbox.py":"sandbox.js"}</span>
-              {curCode&&<button className="rb" onClick={()=>rawExecute(curCode,lang)} style={{
+              {curCode&&<button className="rb" disabled={running||loading} onClick={async()=>{ const r=await rawExecute(curCode,lang); if(r&&!r.replaced){ setOutput(r); setRightTab("output"); } }} style={{
                 marginLeft:"auto",background:C.greenDim,border:`1px solid ${C.green}44`,
                 color:C.green,padding:"2px 10px",borderRadius:4,fontSize:9,
                 cursor:"pointer",fontFamily:"inherit" }}>▶ Run</button>}
@@ -3069,6 +3258,7 @@ export default function WritingOS() {
               ))}
             </div>
             <div style={{ flex:1,overflowY:"auto" }}>
+              <PaneBoundary tab={rightTab} output={output}>
               {rightTab==="output"&&<OutputPane result={output.result} error={output.error}
                 running={running} retrying={retrying} retryLog={retryLog}
                 pyStatus={lang==="py"&&!pyReady?pyStatus:""}/>}
@@ -3081,6 +3271,7 @@ export default function WritingOS() {
               {rightTab==="assert"&&<AssertionPane
                 result={assertResult} checking={assertChecking}
                 onAutoFix={handleAutoFix} onRecheck={handleRecheck}/>}
+              </PaneBoundary>
             </div>
           </div>
         </div>
@@ -3092,8 +3283,13 @@ export default function WritingOS() {
         <span style={{ color:C.green }}>● Writing OS Unified</span>
         <span style={{ color:C.yellow }}>⬡ Semantic Router</span>
         <span style={{ color:ac }}>
-          {lang==="py"?`Python 3.11 · Pyodide WASM${execCount>0?` · ${execCount} runs`:""}` :"JavaScript · Web Worker"}
+          {lang==="py"?`Python 3.11 · Pyodide WASM${execCount>0?` · ${execCount} runs`:""}`
+            :`JavaScript · ${jsTier==="frame"?"изолированная песочница":jsTier==="worker"?"Web Worker":jsTier==="inline"?"в странице":"Web Worker"}`}
         </span>
+        {lang==="js"&&jsTier==="worker"&&<span style={{ color:C.yellow }}
+          title="Песочница-iframe недоступна: код изолирован от страницы, но сетевые запросы блокирует только политика хоста">⚠ JS без сетевой изоляции</span>}
+        {lang==="js"&&jsTier==="inline"&&<span style={{ color:C.yellow }}
+          title="Worker недоступен в этом окружении: код выполняется в самой странице, без изоляции и без таймаута">⚠ JS без изоляции и таймаута</span>}
         {lang==="py"&&pyMode==="main"&&<span style={{ color:C.yellow }}
           title="Worker недоступен в этом окружении: бесконечный цикл Python нельзя прервать">⚠ Python без защиты от зависаний</span>}
         {streaming&&<span style={{ color:C.green,animation:"streamPulse 1s infinite" }}>▶ streaming</span>}
