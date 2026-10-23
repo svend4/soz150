@@ -1556,15 +1556,28 @@ function zipStore(files, date = new Date()) {
 }
 
 const xmlEsc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-// Keep only characters XML 1.0 allows: control characters are dropped, lone surrogates become U+FFFD.
+// Keep only characters XML 1.0 allows (and Word is happy with). Separators keep their MEANING instead of
+// gluing the neighbouring words together: VT / FF / NEL / U+2028 / U+2029 → new line, FS..US → space.
+// Other control characters, C1, DEL, noncharacters (U+FDD0..FDEF, U+nFFFE/FFFF) are dropped; lone surrogates → U+FFFD.
 function xmlClean(str) {
   const s = String(str);
   let out = "";
   for (let i = 0; i < s.length; i++) {
     const c = s.charCodeAt(i);
-    if (c === 9 || c === 10 || c === 13 || (c >= 0x20 && c <= 0xD7FF) || (c >= 0xE000 && c <= 0xFFFD)) out += s[i];
-    else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length && s.charCodeAt(i + 1) >= 0xDC00 && s.charCodeAt(i + 1) <= 0xDFFF) { out += s[i] + s[i + 1]; i++; }
-    else if (c >= 0xD800 && c <= 0xDFFF) out += "�";
+    if (c === 9 || c === 10 || c === 13) out += s[i];
+    else if (c === 0x0B || c === 0x0C || c === 0x85 || c === 0x2028 || c === 0x2029) out += "\n";
+    else if (c >= 0x1C && c <= 0x1F) out += " ";
+    else if (c < 0x20 || (c >= 0x7F && c <= 0x9F) || (c >= 0xFDD0 && c <= 0xFDEF) || c === 0xFFFE || c === 0xFFFF) continue;
+    else if (c >= 0xD800 && c <= 0xDBFF) {
+      const d = i + 1 < s.length ? s.charCodeAt(i + 1) : 0;
+      if (d >= 0xDC00 && d <= 0xDFFF) {
+        const cp = 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00);
+        if ((cp & 0xFFFF) < 0xFFFE) out += s[i] + s[i + 1];   // astral noncharacters are dropped
+        i++;
+      } else out += "\uFFFD";
+    }
+    else if (c >= 0xDC00 && c <= 0xDFFF) out += "\uFFFD";
+    else out += s[i];
   }
   return out;
 }
@@ -1580,11 +1593,11 @@ function docxRun(text, bold) {
 function docxParagraph(line) {
   if (!line.trim()) return "<w:p/>";
   let bold = false, text = line;
-  const h = text.match(/^\s{0,3}#{1,6}\s+(.*)$/);                  // markdown heading → bold paragraph
+  const h = text.match(/^\s{0,3}#{1,6}\s+([\s\S]*)$/);                  // markdown heading → bold paragraph
   if (h) { text = h[1]; bold = true; }
   else if (/^\s*(BETREFF|Betreff)\s*:/.test(text)) bold = true;
   // **bold** spans (an unbalanced ** is kept literally)
-  const runs = []; let last = 0, m; const re = /\*\*([^*\n]+?)\*\*/g;
+  const runs = []; let last = 0, m; const re = /\*\*((?:[^*\n]|\*(?!\*))+)\*\*/g;
   while ((m = re.exec(text))) { runs.push(docxRun(text.slice(last, m.index), bold), docxRun(m[1], true)); last = m.index + m[0].length; }
   runs.push(docxRun(text.slice(last), bold));
   return `<w:p>${runs.join("")}</w:p>`;
@@ -1593,7 +1606,7 @@ function docxParagraph(line) {
 const looksTabular = text => (text.match(/^.*\S {3,}\S.*$/gm) || []).length >= 3 || /[│┌└├─]{3,}/.test(text);
 
 // text → Uint8Array of a .docx file (A4, Arial 11 pt, DIN-5008-like margins: 25 mm left, 20 mm elsewhere)
-function buildDocx(text, { title = "Writing OS", mono } = {}) {
+function buildDocx(text, { title = "Writing OS", mono, date = new Date() } = {}) {
   const clean = xmlClean(text).replace(/\r\n?/g, "\n");
   const useMono = mono ?? looksTabular(clean);
   const cyr = (clean.match(/[Ѐ-ӿ]/g) || []).length, letters = (clean.match(/\p{L}/gu) || []).length || 1;
@@ -1602,7 +1615,7 @@ function buildDocx(text, { title = "Writing OS", mono } = {}) {
   const NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
   const HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
   const body = clean.split("\n").map(docxParagraph).join("");
-  const now = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+  const now = date.toISOString().replace(/\.\d+Z$/, "Z");
   const enc = new TextEncoder();
   const part = (name, xml) => ({ name, data: enc.encode(HEAD + xml) });
   return zipStore([
@@ -1612,6 +1625,7 @@ function buildDocx(text, { title = "Writing OS", mono } = {}) {
       + '<Default Extension="xml" ContentType="application/xml"/>'
       + '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
       + '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
+      + '<Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/>'
       + '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
       + '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>'
       + '</Types>'),
@@ -1624,7 +1638,11 @@ function buildDocx(text, { title = "Writing OS", mono } = {}) {
     part("word/_rels/document.xml.rels",
       '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
       + '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+      + '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>'
       + '</Relationships>'),
+    // compatibilityMode 15 = current Word layout; without it Word shows "[Compatibility Mode]" in the title bar
+    part("word/settings.xml",
+      `<w:settings ${NS}><w:compat><w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="15"/></w:compat></w:settings>`),
     part("word/styles.xml",
       `<w:styles ${NS}><w:docDefaults><w:rPrDefault><w:rPr>`
       + `<w:rFonts w:ascii="${font}" w:hAnsi="${font}" w:eastAsia="${font}" w:cs="${font}"/><w:sz w:val="${size}"/><w:szCs w:val="${size}"/>`
@@ -1642,7 +1660,7 @@ function buildDocx(text, { title = "Writing OS", mono } = {}) {
       + `<dcterms:created xsi:type="dcterms:W3CDTF">${now}</dcterms:created><dcterms:modified xsi:type="dcterms:W3CDTF">${now}</dcterms:modified></cp:coreProperties>`),
     part("docProps/app.xml",
       '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>Writing OS</Application></Properties>'),
-  ]);
+  ], date);
 }
 
 const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
